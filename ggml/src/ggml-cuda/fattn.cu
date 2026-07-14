@@ -4,7 +4,12 @@
 #include "fattn-tile.cuh"
 #include "fattn-vec.cuh"
 #include "fattn-wmma-f16.cuh"
+#include "fattn-wmma-d256-rdna35.cuh"
 #include "fattn.cuh"
+#ifdef GGML_HIP_CK_FATTN
+#include "fattn-ck.h"
+#include "convert.cuh"
+#endif
 
 template <int DKQ, int DV, int ncols2>
 static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -242,6 +247,260 @@ static void ggml_cuda_flash_attn_ext_mma_f16(ggml_backend_cuda_context & ctx, gg
     }
 }
 
+// Stage 24 Phase 2: WMMA FA for D=256 on RDNA3.5 (gfx1151). Dedicated launcher — bypasses
+// launch_fattn's stream-K machinery; the kernel writes final results directly to dst.
+// Kernel: flash_attn_wmma_d256_rdna35 (Bc=32, NWARPS=4, 1 block/CU) — validated 39.1% peak.
+static void ggml_cuda_flash_attn_ext_mma_f16_d256_rdna35(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * Q    = dst->src[0];
+    const ggml_tensor * K    = dst->src[1];
+    const ggml_tensor * V    = dst->src[2];
+    const ggml_tensor * mask = dst->src[3];
+    ggml_tensor * KQV = dst;
+
+    GGML_ASSERT(Q->ne[0] == 256 && K->ne[0] == 256 && V->ne[0] == 256);
+    GGML_ASSERT(Q->type == GGML_TYPE_F32 && KQV->type == GGML_TYPE_F32);
+    GGML_ASSERT(Q->ne[2] % K->ne[2] == 0);
+    GGML_ASSERT(Q->ne[2] / K->ne[2] == 8);  // GQA=8
+
+    float scale = 1.0f, max_bias = 0.0f, logit_softcap = 0.0f;
+    memcpy(&scale,         (const float *) KQV->op_params + 0, sizeof(float));
+    memcpy(&max_bias,      (const float *) KQV->op_params + 1, sizeof(float));
+    memcpy(&logit_softcap, (const float *) KQV->op_params + 2, sizeof(float));
+    GGML_ASSERT(max_bias == 0.0f);       // gqa_opt_applies guarantees this
+    GGML_ASSERT(logit_softcap == 0.0f);  // first cut: no softcap (prototype has none)
+
+    ggml_cuda_pool & pool   = ctx.pool();
+    cudaStream_t    stream  = ctx.stream();
+
+    const bool V_is_K_view = V->view_src && (V->view_src == K || (V->view_src == K->view_src && V->view_offs == K->view_offs));
+
+    // carve f16 K/V workspace from trailing region of dst->data (reserved by get_alloc_size)
+    const ggml_cuda_flash_attn_ext_f16_extra_data f16_extra =
+        ggml_cuda_flash_attn_ext_get_f16_extra_data(KQV, /*need_f16_K=*/true, /*need_f16_V=*/true);
+
+    const char * K_data = (const char *) K->data;
+    size_t nb11 = K->nb[1], nb12 = K->nb[2], nb13 = K->nb[3];
+    const char * V_data = (const char *) V->data;
+    size_t nb21 = V->nb[1], nb22 = V->nb[2], nb23 = V->nb[3];
+
+    // convert K -> f16 if needed (result is contiguous f16)
+    if (K->type != GGML_TYPE_F16) {
+        const size_t bs = ggml_blck_size(K->type);
+        const size_t ts = ggml_type_size(K->type);
+        GGML_ASSERT(f16_extra.K != 0);
+        half * K_f16 = (half *) f16_extra.K;
+        if (ggml_is_contiguously_allocated(K)) {
+            to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(K->type);
+            to_fp16(K_data, K_f16, ggml_nelements(K), stream);
+            nb11 = nb11*bs*sizeof(half)/ts;
+            nb12 = nb12*bs*sizeof(half)/ts;
+            nb13 = nb13*bs*sizeof(half)/ts;
+        } else {
+            GGML_ASSERT(K->nb[0] == ts);
+            to_fp16_nc_cuda_t to_fp16 = ggml_get_to_fp16_nc_cuda(K->type);
+            to_fp16(K_data, K_f16, K->ne[0], K->ne[1], K->ne[2], K->ne[3], nb11/ts, nb12/ts, nb13/ts, stream);
+            nb11 = K->ne[0]*sizeof(half); nb12 = K->ne[1]*nb11; nb13 = K->ne[2]*nb12;
+        }
+        K_data = (const char *) K_f16;
+    }
+    // convert V -> f16 if needed
+    if (V->type != GGML_TYPE_F16) {
+        if (V_is_K_view) {
+            V_data = K_data; nb21 = nb11; nb22 = nb12; nb23 = nb13;
+        } else {
+            const size_t bs = ggml_blck_size(V->type);
+            const size_t ts = ggml_type_size(V->type);
+            GGML_ASSERT(f16_extra.V != 0);
+            half * V_f16 = (half *) f16_extra.V;
+            if (ggml_is_contiguously_allocated(V)) {
+                to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(V->type);
+                to_fp16(V_data, V_f16, ggml_nelements(V), stream);
+                nb21 = nb21*bs*sizeof(half)/ts;
+                nb22 = nb22*bs*sizeof(half)/ts;
+                nb23 = nb23*bs*sizeof(half)/ts;
+            } else {
+                GGML_ASSERT(V->nb[0] == ts);
+                to_fp16_nc_cuda_t to_fp16 = ggml_get_to_fp16_nc_cuda(V->type);
+                to_fp16(V_data, V_f16, V->ne[0], V->ne[1], V->ne[2], V->ne[3], nb21/ts, nb22/ts, nb23/ts, stream);
+                nb21 = V->ne[0]*sizeof(half); nb22 = V->ne[1]*nb21; nb23 = V->ne[2]*nb22;
+            }
+            V_data = (const char *) V_f16;
+        }
+    }
+    // K/V may be f16 with non-contiguous rows (KV-cache views); the kernel indexes via nb11/nb21.
+
+    // Bc=16 activates the 2-slot double-buffer (NSLOT = Bc<=16 ? 2 : 1) for the async K/V
+    // software-pipeline. LDS is unchanged vs Bc=32: 2*(16*RS)*2byte per K and V == 1*(32*RS)*2,
+    // so double-buffering fits the same 35840 B group-segment while keeping the +8 bank pad.
+    constexpr int D = 256, Bc = 16, BR_BLOCK = 16, NWARPS = 4;
+    // #10/#9 correctness preconditions for the WMMA kernel.
+    GGML_ASSERT(Q->ne[2] % NWARPS == 0);     // partial Q-head block early-returns before __syncthreads -> deadlock
+    GGML_ASSERT(ggml_is_contiguous(KQV));    // kernel writes dst as contiguous [ne01*D] rows
+    // #3: tail KV chunk handled in-kernel by ceil nchunks + zero-fill (no K->ne[1]%Bc assert needed).
+    const int ntiles_x = (Q->ne[1] + BR_BLOCK - 1) / BR_BLOCK;
+
+    // Optional mask scan: per-tile KV upper bound (skips fully-masked trailing chunks).
+    // Mirrors fattn-common.cuh launch_fattn; only worth it for large Q batches.
+    ggml_cuda_pool_alloc<int> KV_max(pool);
+    if (mask && K->ne[1] % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || Q->ne[3] > 1)) {
+        const int s31 = mask->nb[1] / sizeof(half2);
+        const int s33 = mask->nb[3] / sizeof(half2);
+        const dim3 blocks_num_KV_max(ntiles_x, Q->ne[3], 1);
+        const dim3 block_dim_KV_max(FATTN_KQ_STRIDE/2, 1, 1);
+        KV_max.alloc((size_t)blocks_num_KV_max.x * blocks_num_KV_max.y);
+        flash_attn_mask_to_KV_max<BR_BLOCK><<<blocks_num_KV_max, block_dim_KV_max, 0, stream>>>(
+            (const half2 *) mask->data, KV_max.ptr, K->ne[1] / FATTN_KQ_STRIDE, s31, s33);
+        CUDA_CHECK(cudaGetLastError());
+    }
+
+    const dim3 block_dim(32, NWARPS, 1);
+    const dim3 grid(ntiles_x, (Q->ne[2] + NWARPS - 1) / NWARPS, Q->ne[3]);
+
+    // static shared memory only (sK/sV declared __shared__ in the kernel); dynamic shmem = 0.
+    ggml_cuda_kernel_launch_params lp(grid, block_dim, (size_t)0, stream);
+    ggml_cuda_kernel_launch(flash_attn_wmma_d256_rdna35<D, Bc, BR_BLOCK, NWARPS>, lp,
+        (const char *) Q->data,
+        (const half *) K_data,
+        (const half *) V_data,
+        mask ? (const half *) mask->data : nullptr,
+        KV_max.ptr,
+        (float *) KQV->data,
+        scale,
+        (int32_t)Q->ne[1], (int32_t)Q->ne[2], (int32_t)K->ne[1], (int32_t)K->ne[2],
+        (int32_t)Q->ne[3], (int32_t)(mask ? mask->ne[3] : 1),
+        (int32_t)Q->nb[1], (int32_t)Q->nb[2], (int64_t)Q->nb[3],
+        (int32_t)nb11, (int32_t)nb12, (int64_t)nb13,
+        (int32_t)nb21, (int32_t)nb22, (int64_t)nb23,
+        (int32_t)(mask ? mask->nb[1] : 0), (int64_t)(mask ? mask->nb[3] : 0));
+    CUDA_CHECK(cudaGetLastError());
+}
+
+#ifdef GGML_HIP_CK_FATTN
+// Spike: route the D=256 GQA=8 causal prefill op through CK ck_tile FMHA.
+// Returns true if CK handled the op; false to fall back to the hand-written kernel.
+static bool ggml_cuda_flash_attn_ext_ck_d256(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * Q = dst->src[0];
+    const ggml_tensor * K = dst->src[1];
+    const ggml_tensor * V = dst->src[2];
+    ggml_tensor * KQV = dst;
+
+    GGML_ASSERT(Q->type == GGML_TYPE_F32 && KQV->type == GGML_TYPE_F32);
+
+    float scale = 1.0f, max_bias = 0.0f, logit_softcap = 0.0f;
+    memcpy(&scale,         (const float *) KQV->op_params + 0, sizeof(float));
+    memcpy(&max_bias,      (const float *) KQV->op_params + 1, sizeof(float));
+    memcpy(&logit_softcap, (const float *) KQV->op_params + 2, sizeof(float));
+    GGML_ASSERT(max_bias == 0.0f && logit_softcap == 0.0f);
+
+    ggml_cuda_pool & pool  = ctx.pool();
+    cudaStream_t     stream = ctx.stream();
+
+    const int64_t d       = Q->ne[0];
+    const int64_t nq      = Q->ne[1];
+    const int64_t nhead_q = Q->ne[2];
+    const int64_t batch   = Q->ne[3];
+    const int64_t nkv     = K->ne[1];
+    const int64_t nhead_k = K->ne[2];
+
+    const bool V_is_K_view = V->view_src && (V->view_src == K || (V->view_src == K->view_src && V->view_offs == K->view_offs));
+
+    const ggml_cuda_flash_attn_ext_f16_extra_data f16_extra =
+        ggml_cuda_flash_attn_ext_get_f16_extra_data(KQV, /*need_f16_K=*/true, /*need_f16_V=*/true);
+
+    // K/V -> f16 (contiguous), mirroring the hand-written launcher's plumbing.
+    const char * K_data = (const char *) K->data;
+    size_t nb11 = K->nb[1], nb12 = K->nb[2], nb13 = K->nb[3];
+    const char * V_data = (const char *) V->data;
+    size_t nb21 = V->nb[1], nb22 = V->nb[2], nb23 = V->nb[3];
+
+    if (K->type != GGML_TYPE_F16) {
+        const size_t bs = ggml_blck_size(K->type);
+        const size_t ts = ggml_type_size(K->type);
+        GGML_ASSERT(f16_extra.K != 0);
+        half * K_f16 = (half *) f16_extra.K;
+        if (ggml_is_contiguously_allocated(K)) {
+            to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(K->type);
+            to_fp16(K_data, K_f16, ggml_nelements(K), stream);
+            nb11 = nb11*bs*sizeof(half)/ts; nb12 = nb12*bs*sizeof(half)/ts; nb13 = nb13*bs*sizeof(half)/ts;
+        } else {
+            GGML_ASSERT(K->nb[0] == ts);
+            to_fp16_nc_cuda_t to_fp16 = ggml_get_to_fp16_nc_cuda(K->type);
+            to_fp16(K_data, K_f16, K->ne[0], K->ne[1], K->ne[2], K->ne[3], nb11/ts, nb12/ts, nb13/ts, stream);
+            nb11 = K->ne[0]*sizeof(half); nb12 = K->ne[1]*nb11; nb13 = K->ne[2]*nb12;
+        }
+        K_data = (const char *) K_f16;
+    }
+    if (V->type != GGML_TYPE_F16) {
+        if (V_is_K_view) {
+            V_data = K_data; nb21 = nb11; nb22 = nb12; nb23 = nb13;
+        } else {
+            const size_t bs = ggml_blck_size(V->type);
+            const size_t ts = ggml_type_size(V->type);
+            GGML_ASSERT(f16_extra.V != 0);
+            half * V_f16 = (half *) f16_extra.V;
+            if (ggml_is_contiguously_allocated(V)) {
+                to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(V->type);
+                to_fp16(V_data, V_f16, ggml_nelements(V), stream);
+                nb21 = nb21*bs*sizeof(half)/ts; nb22 = nb22*bs*sizeof(half)/ts; nb23 = nb23*bs*sizeof(half)/ts;
+            } else {
+                GGML_ASSERT(V->nb[0] == ts);
+                to_fp16_nc_cuda_t to_fp16 = ggml_get_to_fp16_nc_cuda(V->type);
+                to_fp16(V_data, V_f16, V->ne[0], V->ne[1], V->ne[2], V->ne[3], nb21/ts, nb22/ts, nb23/ts, stream);
+                nb21 = V->ne[0]*sizeof(half); nb22 = V->ne[1]*nb21; nb23 = V->ne[2]*nb22;
+            }
+            V_data = (const char *) V_f16;
+        }
+    }
+
+    // Q F32 -> contiguous f16 workspace; O produced as f16 then converted to the F32 dst.
+    ggml_cuda_pool_alloc<half> Q_f16(pool, ggml_nelements(Q));
+    ggml_cuda_pool_alloc<half> O_f16(pool, ggml_nelements(dst));
+    {
+        to_fp16_nc_cuda_t to_fp16 = ggml_get_to_fp16_nc_cuda(GGML_TYPE_F32);
+        to_fp16((const char *) Q->data, Q_f16.ptr, Q->ne[0], Q->ne[1], Q->ne[2], Q->ne[3],
+                Q->nb[1]/sizeof(float), Q->nb[2]/sizeof(float), Q->nb[3]/sizeof(float), stream);
+    }
+
+    // Q_f16 is a contiguous [d, seq, head] workspace -> CK i_perm=true layout.
+    const long q_stride  = d;
+    const long q_nhstr   = nq * d;
+    const long q_bstr    = nhead_q * nq * d;
+    // O_f16 must match dst's contiguous [d, head, seq] layout (flat convert to F32 dst)
+    // -> CK o_perm=false layout: seq stride = nhead*d, head stride = d.
+    const long o_stride  = nhead_q * d;
+    const long o_nhstr   = d;
+    const long o_bstr    = nhead_q * nq * d;
+    const long k_stride  = (long)(nb11 / sizeof(half));
+    const long k_nhstr   = (long)(nb12 / sizeof(half));
+    const long k_bstr    = (long)(nb13 / sizeof(half));
+    const long v_stride  = (long)(nb21 / sizeof(half));
+    const long v_nhstr   = (long)(nb22 / sizeof(half));
+    const long v_bstr    = (long)(nb23 / sizeof(half));
+
+    // ggml chunked prefill: seqlen_q <= seqlen_k with the diagonal at the bottom-right.
+    const int mask_type = 2; // bottom-right causal
+
+    const float r = ggml_cuda_fa_ck_d256_fp16(
+        Q_f16.ptr, K_data, V_data, O_f16.ptr,
+        (int)batch, (int)nhead_q, (int)nhead_k, (int)nq, (int)nkv, (int)d, scale,
+        q_stride, q_nhstr, q_bstr,
+        k_stride, k_nhstr, k_bstr,
+        v_stride, v_nhstr, v_bstr,
+        o_stride, o_nhstr, o_bstr,
+        mask_type, (void *) stream);
+
+    if (r < 0.0f) {
+        return false; // no CK instance matched; caller falls back
+    }
+
+    to_fp32_cuda_t to_fp32 = ggml_get_to_fp32_cuda(GGML_TYPE_F16);
+    to_fp32((const void *) O_f16.ptr, (float *) dst->data, ggml_nelements(dst), stream);
+    CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+#endif // GGML_HIP_CK_FATTN
+
+
 #define FATTN_VEC_CASE(D, type_K, type_V)                                                                        \
     {                                                                                                            \
         const bool type_K_okay = K->type == (type_K) || (K->type == GGML_TYPE_F32 && (type_K) == GGML_TYPE_F16); \
@@ -330,11 +589,12 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
 
 // Best FlashAttention kernel for a specific GPU:
 enum best_fattn_kernel {
-    BEST_FATTN_KERNEL_NONE     =   0,
-    BEST_FATTN_KERNEL_TILE     = 200,
-    BEST_FATTN_KERNEL_VEC      = 100,
-    BEST_FATTN_KERNEL_WMMA_F16 = 300,
-    BEST_FATTN_KERNEL_MMA_F16  = 400,
+    BEST_FATTN_KERNEL_NONE                =   0,
+    BEST_FATTN_KERNEL_TILE                = 200,
+    BEST_FATTN_KERNEL_VEC                 = 100,
+    BEST_FATTN_KERNEL_WMMA_F16            = 300,
+    BEST_FATTN_KERNEL_MMA_F16             = 400,
+    BEST_FATTN_KERNEL_MMA_F16_D256_RDNA35 = 450,
 };
 
 static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const ggml_tensor * dst) {
@@ -520,6 +780,15 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         return BEST_FATTN_KERNEL_MMA_F16;
     }
 
+    // RDNA3.5 D=256 prefill path: FP32-accumulate PV, reduced VGPR tile sizes.
+    if (amd_wmma_available(cc) &&
+            gqa_opt_applies &&
+            Q->ne[0] == 256 && K->ne[0] == 256 && V->ne[0] == 256 &&
+            Q->ne[1] >= 256 &&
+            Q->ne[1] * gqa_ratio_eff > 8) {
+        return BEST_FATTN_KERNEL_MMA_F16_D256_RDNA35;
+    }
+
     // If there are no tensor cores available, use the generic tile kernel:
     if (can_use_vector_kernel) {
         if (!ggml_is_quantized(K->type) && !ggml_is_quantized(V->type)) {
@@ -555,6 +824,7 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
         case BEST_FATTN_KERNEL_TILE:
         case BEST_FATTN_KERNEL_WMMA_F16:
         case BEST_FATTN_KERNEL_MMA_F16:
+        case BEST_FATTN_KERNEL_MMA_F16_D256_RDNA35:
             need_f16_K = true;
             need_f16_V = true;
             break;
@@ -588,6 +858,14 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             break;
         case BEST_FATTN_KERNEL_MMA_F16:
             ggml_cuda_flash_attn_ext_mma_f16(ctx, dst);
+            break;
+        case BEST_FATTN_KERNEL_MMA_F16_D256_RDNA35:
+#ifdef GGML_HIP_CK_FATTN
+            if (ggml_cuda_flash_attn_ext_ck_d256(ctx, dst)) {
+                break;
+            }
+#endif
+            ggml_cuda_flash_attn_ext_mma_f16_d256_rdna35(ctx, dst);
             break;
     }
 }

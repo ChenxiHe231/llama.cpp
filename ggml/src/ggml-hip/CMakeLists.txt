@@ -155,3 +155,54 @@ if (GGML_HIP_RCCL)
 endif()
 
 target_link_libraries(ggml-hip PRIVATE ggml-base hip::host roc::rocblas roc::hipblas)
+
+# --- CK ck_tile FMHA integration (spike) ---------------------------------
+# Compile fattn-ck.cu against CK's own ck_tile headers and link the pre-built
+# generated instance objects + the fmha_fwd_api object. Enabled by -DGGML_HIP_CK_FATTN=ON.
+#
+# This path is a spike: it links PRE-GENERATED CK ck_tile FMHA instance objects
+# rather than building CK from source in-tree. You must point it at a CK checkout
+# and a directory of pre-built (-fPIC) instance .o files via cache variables:
+#
+#   -DGGML_HIP_CK_FATTN=ON
+#   -DCK_SRC=/path/to/composable_kernel            (CK source checkout)
+#   -DCK_INSTDIR=/path/to/prebuilt-ck-instances    (fmha_fwd_d256_fp16_batch_*.o + fmha_fwd_api.cpp.o, all -fPIC)
+#   [-DCK_BUILD=/path/to/ck/build]                 (defaults to ${CK_SRC}/build)
+#
+# The instance objects are produced by CK's codegen (example/ck_tile/01_fmha) filtered
+# to the d256/fp16 case and recompiled with -fPIC (ggml-hip is a shared lib). See
+# stage25 notes for the generation recipe. TODO(productionize): replace this pre-built
+# link with a proper vendored-CK ExternalProject/codegen step so the build is
+# self-contained and portable (Windows/other machines).
+if (GGML_HIP_CK_FATTN)
+    set(CK_SRC     "" CACHE PATH "Composable Kernel source checkout (contains include/, library/, example/ck_tile)")
+    set(CK_INSTDIR "" CACHE PATH "Directory of pre-built (-fPIC) CK ck_tile FMHA instance .o files")
+    set(CK_BUILD   "" CACHE PATH "CK build dir with generated headers (defaults to \${CK_SRC}/build)")
+
+    if (NOT CK_SRC OR NOT IS_DIRECTORY "${CK_SRC}")
+        message(FATAL_ERROR "GGML_HIP_CK_FATTN=ON requires -DCK_SRC=<composable_kernel checkout>; got '${CK_SRC}'")
+    endif()
+    if (NOT CK_INSTDIR OR NOT IS_DIRECTORY "${CK_INSTDIR}")
+        message(FATAL_ERROR "GGML_HIP_CK_FATTN=ON requires -DCK_INSTDIR=<dir of pre-built CK instance .o>; got '${CK_INSTDIR}'")
+    endif()
+    if (NOT CK_BUILD)
+        set(CK_BUILD "${CK_SRC}/build")
+    endif()
+
+    add_compile_definitions(GGML_HIP_CK_FATTN)
+
+    set_source_files_properties(
+        ../ggml-cuda/fattn-ck.cu PROPERTIES
+        INCLUDE_DIRECTORIES
+        "${CK_SRC}/include;${CK_BUILD}/include;${CK_SRC}/library/include;${CK_SRC}/example/ck_tile;${CK_SRC}/example/ck_tile/01_fmha"
+        COMPILE_OPTIONS
+        "-DCK_TILE_USE_WMMA=1;-DCK_USE_WMMA;-DCK_ENABLE_FP16;-DCK_TILE_FMHA_FWD_FAST_EXP2=1;-fbracket-depth=1024;-Wno-everything")
+
+    file(GLOB CK_INSTANCE_OBJS "${CK_INSTDIR}/fmha_fwd_d256_fp16_batch_*.o")
+    list(APPEND CK_INSTANCE_OBJS "${CK_INSTDIR}/fmha_fwd_api.cpp.o")
+    if (NOT CK_INSTANCE_OBJS)
+        message(FATAL_ERROR "No CK instance objects found in CK_INSTDIR='${CK_INSTDIR}' (expected fmha_fwd_d256_fp16_batch_*.o)")
+    endif()
+    target_link_libraries(ggml-hip PRIVATE ${CK_INSTANCE_OBJS})
+endif()
+

@@ -160,9 +160,9 @@ bool ggml_cuda_should_use_mmf(enum ggml_type type, int cc, int warp_size, const 
     }
 
     if (mul_mat_id) {
-        if (src0_ne[1] <= 1024 && src1_ncols > 512) {
+        if (src0_ne[1] <= 1024 && src1_ncols > 2048) {
             return false;
-        } else if(src0_ne[1] > 1024 && src1_ncols > 128) {
+        } else if(src0_ne[1] > 1024 && src1_ncols > 2048) {
             return false;
         }
     } else {

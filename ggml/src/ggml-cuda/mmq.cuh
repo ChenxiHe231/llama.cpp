@@ -107,6 +107,12 @@ struct tile_x_sizes {
 };
 
 static int get_mmq_x_max_host(const int cc) {
+    // gfx1151 (RDNA3.5, Ryzen AI Max+ 395) hits VGPR=256 with mmq_x=128 which forces
+    // occupancy to ~1 block/CU (~23%). Capping at 64 halves the sum[]/tile_A live
+    // registers so 2 blocks/CU can co-reside and hide LDS/mem latency.
+    if (GGML_CUDA_CC_IS_RDNA3_5(cc)) {
+        return 64;
+    }
     return (turing_mma_available(cc) || amd_wmma_available(cc)) ? 128 :
         GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_VOLTA ?
 #ifdef GGML_CUDA_FORCE_MMQ
@@ -117,7 +123,10 @@ static int get_mmq_x_max_host(const int cc) {
 }
 
 static constexpr __device__ int get_mmq_x_max_device() {
-#if defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+#if defined(RDNA3_5)
+    // See host counterpart above: register-pressure-limited occupancy on gfx1151.
+    return 64;
+#elif defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
     return 128;
 #else // defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
 
@@ -3457,8 +3466,13 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
     constexpr load_tiles_mmq_t load_tiles = mmq_type_traits<mmq_x, mmq_y, need_check, type>::load_tiles;
 
     extern __shared__ int data_mul_mat_q[];
-    int * tile_y = data_mul_mat_q + mmq_x;
-    int * tile_x = tile_y + GGML_PAD(mmq_x*MMQ_TILE_Y_K, nwarps*warp_size);
+    // Double-buffer tile_y: load both K-sub-blocks of a kb0 iteration into two
+    // separate LDS buffers up front, so the two vec_dot calls no longer reuse one
+    // buffer. Removes the two mid-iteration __syncthreads (WAR+RAW) single-buffering needed.
+    constexpr int tile_y_stride = GGML_PAD(mmq_x*MMQ_TILE_Y_K, nwarps*warp_size);
+    int * tile_y  = data_mul_mat_q + mmq_x;
+    int * tile_y2 = tile_y  + tile_y_stride;
+    int * tile_x  = tile_y2 + tile_y_stride;
 
 #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
     constexpr vec_dot_mmq_t    vec_dot    = mmq_type_traits<mmq_x, mmq_y, need_check, type>::vec_dot_mma;
@@ -3486,33 +3500,20 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
         load_tiles(x, tile_x, offset_x + kb0, tile_x_max_i, stride_row_x);
         {
             const int * by0 = y + ncols_y * (kb0 * qk / ne_block) * sz;
+            const int * by1 = y + ncols_y * ((kb0 * qk / ne_block) * sz + sz);
 #pragma unroll
             for (int l0 = 0; l0 < mmq_x * MMQ_TILE_Y_K; l0 += nwarps * warp_size) {
                 int l = l0 + threadIdx.y*warp_size + threadIdx.x;
 
-                tile_y[l] = by0[l];
+                tile_y[l]  = by0[l];
+                tile_y2[l] = by1[l];
             }
         }
 
         __syncthreads();
 
-        vec_dot(tile_x, tile_y, sum, 0);
-
-        __syncthreads();
-
-        {
-            const int * by0 = y + ncols_y * ((kb0 * qk / ne_block) * sz + sz);
-#pragma unroll
-            for (int l0 = 0; l0 < mmq_x * MMQ_TILE_Y_K; l0 += nwarps * warp_size) {
-                int l = l0 + threadIdx.y*warp_size + threadIdx.x;
-
-                tile_y[l] = by0[l];
-            }
-        }
-
-        __syncthreads();
-
-        vec_dot(tile_x, tile_y, sum, MMQ_TILE_NE_K);
+        vec_dot(tile_x, tile_y,  sum, 0);
+        vec_dot(tile_x, tile_y2, sum, MMQ_TILE_NE_K);
 
         __syncthreads();
     }
@@ -3935,8 +3936,10 @@ static size_t mmq_get_nbytes_shared(const int mmq_x, const int mmq_y, const int 
     const int mmq_tile_x_k = mmq_get_mma_tile_x_k(type);
     const size_t nbs_ids = mmq_x*sizeof(int);
     const size_t nbs_x = (turing_mma_available(cc) || amd_mfma_available(cc) || amd_wmma_available(cc)) ? mmq_y*mmq_tile_x_k*sizeof(int) : txs.qs*sizeof(int) + txs.dm*sizeof(half2) + txs.sc*sizeof(int);
-    const size_t nbs_y = mmq_x * (sizeof(block_q8_1_mmq));
-    return nbs_ids + nbs_x + GGML_PAD(nbs_y, nwarps*warp_size*sizeof(int));
+    // tile_y double-buffered in kernel: 2 * GGML_PAD(mmq_x*MMQ_TILE_Y_K, nwarps*warp_size) ints.
+    // mmq_x*sizeof(block_q8_1_mmq) == mmq_x*MMQ_TILE_Y_K*sizeof(int); match kernel layout exactly.
+    const size_t nbs_y = 2 * GGML_PAD(mmq_x * (sizeof(block_q8_1_mmq)), nwarps*warp_size*sizeof(int));
+    return nbs_ids + nbs_x + nbs_y;
 }
 
 template <ggml_type type, int mmq_x>

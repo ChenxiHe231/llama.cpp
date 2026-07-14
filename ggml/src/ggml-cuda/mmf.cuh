@@ -741,7 +741,7 @@ static void mul_mat_f_switch_cols_per_block(
         const int64_t nsamples_dst, const int64_t stride_sample_x, const int64_t stride_sample_y, const int64_t stride_sample_dst,
         cudaStream_t stream, const mmf_ids_data * ids_data) {
 
-    const int ncols_case = (ids && ncols_dst > 16) ? 16 : ncols_dst;
+    const int ncols_case = (ids && ncols_dst > 16) ? 32 : ncols_dst;
 
     GGML_ASSERT(ids || ncols_dst <= 16);
 
@@ -826,6 +826,11 @@ static void mul_mat_f_switch_cols_per_block(
                 stride_col_id, stride_row_id, nchannels_x, nchannels_y,  nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, stream, ids_data);
         } break;
+        case 32: {
+            mul_mat_f_cuda<T, rows_per_block, 32>(x, y, ids, dst, ncols_x, nrows_x, ncols_dst, stride_row, stride_col_y, stride_col_dst,
+                stride_col_id, stride_row_id, nchannels_x, nchannels_y,  nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
+                nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, stream, ids_data);
+        } break;
         default: {
             GGML_ABORT("fatal error");
         } break;
@@ -903,6 +908,7 @@ DECL_MMF_CASE_EXTERN(13);
 DECL_MMF_CASE_EXTERN(14);
 DECL_MMF_CASE_EXTERN(15);
 DECL_MMF_CASE_EXTERN(16);
+DECL_MMF_CASE_EXTERN(32);
 #else
 #define DECL_MMF_CASE(ncols_dst)
 #endif

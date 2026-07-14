@@ -157,7 +157,7 @@ static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_co
 
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256,  8,  64, 2,  32, 128, 128, 128, 1, true);
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256, 16,  64, 2,  32, 128, 128, 128, 1, true);
-    GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256, 32, 128, 2,  64, 128, 128,  64, 1, true);
+    GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256, 32, 128, 2,  64, 128, 128,  64, 1, false);
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256, 64, 128, 2,  64, 128, 128,  64, 1, true);
 
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(320, 256, 32, 128, 2,  32, 160, 128, 128, 1, true);
@@ -1067,6 +1067,16 @@ template<int ncols> struct mma_tile_sizes<112, ncols> {
     using T_B_VKQ = tile<16,  8, half2, DATA_LAYOUT_I_MAJOR_MIRRORED>; // column-major
     using T_C_VKQ = tile<16, 16, float, DATA_LAYOUT_I_MAJOR>;          // column-major
 };
+template<int ncols> struct mma_tile_sizes<256, ncols> {
+    using T_A_KQ  = tile<16,  8, half2, DATA_LAYOUT_I_MAJOR_MIRRORED>;
+    using T_B_KQ  = tile<16,  8, half2, DATA_LAYOUT_I_MAJOR_MIRRORED>;
+    using T_C_KQ  = tile<16, 16, float, DATA_LAYOUT_I_MAJOR>;
+    // Avoid the tile<32,8> A operand from the generic RDNA3 path to keep VGPR pressure down.
+    using T_A_VKQ = tile<16,  8, half2, DATA_LAYOUT_I_MAJOR_MIRRORED>;
+    using T_B_VKQ = tile<16,  8, half2, DATA_LAYOUT_I_MAJOR_MIRRORED>;
+    // PV / VKQ must accumulate in FP32 for D=256.
+    using T_C_VKQ = tile<16, 16, float, DATA_LAYOUT_I_MAJOR>;
+};
 #else
 template<int DV, int ncols> struct mma_tile_sizes {
     using T_A_KQ  = tile<16,  8, half2, DATA_LAYOUT_I_MAJOR>;           // row-major
@@ -1759,7 +1769,7 @@ static __global__ void flash_attn_ext_f16(
 #endif // __CUDA_ARCH__ == GGML_CUDA_CC_TURING
 
 #if defined(AMD_WMMA_AVAILABLE)
-    if (ncols1*ncols2 < 16 || ncols2 == 1 || DKQ > 128) {
+    if (ncols1*ncols2 < 16 || ncols2 == 1 || (DKQ > 128 && DKQ != 256)) {
         NO_DEVICE_CODE;
         return;
     }

@@ -309,9 +309,23 @@ static constexpr __host__ __device__ uint32_t ggml_cuda_fattn_tile_get_config_am
     return 0;
 }
 
+// gfx1151 (RDNA3.5) override: the (256,256,32) case is register-pressure limited on Strix Halo.
+// PMC roofline showed VGPR_Count=256 (hardware max) and OccupancyPercent=24.7% (~1 block/WGP)
+// with the default RDNA config nbatch_K=128, occupancy=3. Halving nbatch_K to 64 shrinks the
+// KV_tmp LDS tile and the inner-loop K_k/Q_k register footprint, and asking for occupancy=4
+// forces the compiler to be more aggressive about VGPR reuse.
+static constexpr __host__ __device__ uint32_t ggml_cuda_fattn_tile_get_config_amd_rdna3_5_override(const int DKQ, const int DV, const int ncols) {
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256, 32, 256, 4,  64,  64)
+    return 0;
+}
+
 static __host__ uint32_t ggml_cuda_fattn_tile_get_config(const int DKQ, const int DV, const int ncols, const int cc) {
     if (GGML_CUDA_CC_IS_AMD(cc)) {
         if (GGML_CUDA_CC_IS_RDNA(cc)) {
+            if (GGML_CUDA_CC_IS_RDNA3_5(cc)) {
+                const uint32_t v = ggml_cuda_fattn_tile_get_config_amd_rdna3_5_override(DKQ, DV, ncols);
+                if (v) return v;
+            }
             return ggml_cuda_fattn_tile_get_config_amd_rdna(DKQ, DV, ncols);
         }
         return ggml_cuda_fattn_tile_get_config_amd(DKQ, DV, ncols);
@@ -325,7 +339,13 @@ static __host__ uint32_t ggml_cuda_fattn_tile_get_config(const int DKQ, const in
 static constexpr __device__ uint32_t ggml_cuda_fattn_tile_get_config(const int DKQ, const int DV, const int ncols) {
 #ifdef GGML_USE_HIP
 #ifdef RDNA
+#ifdef RDNA3_5
+    return ggml_cuda_fattn_tile_get_config_amd_rdna3_5_override(DKQ, DV, ncols) != 0
+        ? ggml_cuda_fattn_tile_get_config_amd_rdna3_5_override(DKQ, DV, ncols)
+        : ggml_cuda_fattn_tile_get_config_amd_rdna(DKQ, DV, ncols);
+#else
     return ggml_cuda_fattn_tile_get_config_amd_rdna(DKQ, DV, ncols);
+#endif // RDNA3_5
 #else
     return ggml_cuda_fattn_tile_get_config_amd(DKQ, DV, ncols);
 #endif // RDNA

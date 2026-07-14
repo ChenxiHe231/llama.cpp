@@ -8619,6 +8619,23 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // BF16 mmf (mul_mat_f_ids) target-shape coverage for Qwen3.6-A3B-BF16 MoE (gfx1151)
+    // gfx1151 rows_per_block=32; ids path forces cols_per_block=32 for ncols_dst>16, so the
+    // exercised target instance is mul_mat_f_ids<nv_bfloat162,32,32,nwarps>. 256 experts, top-8,
+    // uniform-random routing (see report). Boundaries: n_token<=8 mmvf(NOT mmf); 9..16 mmf but
+    // mul_mat_f<...,true> non-compact(NOT target); n_token>16 mul_mat_f_ids compact target.
+    // gate/up: K=n_embd=2048, N=n_ff_exp=512 (m=512<=1024 -> mmf while n_token<=2048).
+    for (int n_tok : {8, 9, 16, 32, 64, 512, 2048}) {   // 8/9 straddles the decode(mmvf)<->mmf boundary
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_BF16, GGML_TYPE_F32, 256, 8, false, /*m=N=*/512, /*n=tok=*/n_tok, /*k=K=*/2048));
+    }
+    // down: K=n_ff_exp=512, N=n_embd=2048 (m=2048>1024 -> mmf only while n_token<=512; 513 straddles the mmf->rocBLAS edge)
+    for (int n_tok : {8, 9, 16, 32, 64, 512, 513}) {
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_BF16, GGML_TYPE_F32, 256, 8, false, /*m=N=*/2048, /*n=tok=*/n_tok, /*k=K=*/512));
+    }
+    // 128-expert BF16 variant + gate/up token>2048 rocBLAS-fallback verification
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_BF16, GGML_TYPE_F32, 128, 8, false, 512, 512, 2048));
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_BF16, GGML_TYPE_F32, 256, 8, false, 512, 2049, 2048));
+
     for (ggml_type type_a : base_types) {
         for (ggml_type type_b : {GGML_TYPE_F32, GGML_TYPE_F16}) {
             for (int n : {1, 16}) {
@@ -9095,6 +9112,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 
     // mixed quant and Q1_0 test cases
+    // DIAG p19: cases that actually select flash_attn_wmma_d256_rdna35 (needs D=256, GQA=8, Q batch>=256, kv%256==0)
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 1, {8, 1}, 512,  256, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 1, {8, 1}, 1024, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {8, 1}, 768,  256, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0));
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(72, 72, 4, {1, 1}, 96, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0));
@@ -9358,6 +9379,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
 
+
+    // Qwen3.6-35B-A3B BF16 MoE perf: same target shapes as the eval cases so the
+    // mul_mat_f_ids<nv_bfloat162,32,32,nwarps> BF16 kernels are benchmarked (perf loops
+    // above exclude BF16). gate/up: N=512 K=2048; down: N=2048 K=512; 256 experts top-8.
+    for (int bs : {1, 8, 16, 32, 64, 512, 2048}) {
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_BF16, GGML_TYPE_F32, 256, 8, false, 512, bs, 2048));
+    }
+    for (int bs : {1, 8, 16, 32, 64, 512}) {
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_BF16, GGML_TYPE_F32, 256, 8, false, 2048, bs, 512));
+    }
 
     // gpt-oss-20b
     for (int bs : {1, 4, 8, 512}) {
