@@ -392,17 +392,47 @@ static __global__ void mul_mat_f_ids(
 
     T * tile_xy = (T *) compute_base + threadIdx.y*(tile_A::I * tile_k_padded);
 
-    for (int col = threadIdx.y*warp_size + threadIdx.x; col < ncols; col += nwarps*warp_size) {
-        tile_A A[ntA][warp_size / tile_A::J];
+    // R5-B: cross-K WEIGHT prefetch. Hoist the next col-iteration's weight global
+    // load x[...] into registers so its DRAM read overlaps the current iteration's mma.
+    // Activation gather is left untouched (isolates weight-stream latency).
+    const int col_start  = threadIdx.y*warp_size + threadIdx.x;
+    const int col_stride = nwarps*warp_size;
+    T wp[ntA][tile_A::I];
+    if (col_start < ncols) {
 #pragma unroll
         for (int itA = 0; itA < ntA; ++itA) {
 #pragma unroll
             for (int i = 0; i < tile_A::I; ++i) {
-                tile_xy[i*tile_k_padded + threadIdx.x] = x[(itA*tile_A::I + i)*stride_row  + col];
+                wp[itA][i] = x[(itA*tile_A::I + i)*stride_row + col_start];
+            }
+        }
+    }
+
+    for (int col = col_start; col < ncols; col += col_stride) {
+        tile_A A[ntA][warp_size / tile_A::J];
+        // Consume the prefetched weight for the current iteration: reg -> shared -> ldmatrix.
+#pragma unroll
+        for (int itA = 0; itA < ntA; ++itA) {
+#pragma unroll
+            for (int i = 0; i < tile_A::I; ++i) {
+                tile_xy[i*tile_k_padded + threadIdx.x] = wp[itA][i];
             }
 #pragma unroll
             for (int k0 = 0; k0 < warp_size; k0 += tile_A::J) {
                 load_ldmatrix(A[itA][k0/tile_A::J], tile_xy + k0, tile_k_padded);
+            }
+        }
+
+        // Issue the next iteration's weight global load NOW (before the mma below), so the
+        // weight DRAM read for col+col_stride is in flight while this iteration computes.
+        const int col_next = col + col_stride;
+        if (col_next < ncols) {
+#pragma unroll
+            for (int itA = 0; itA < ntA; ++itA) {
+#pragma unroll
+                for (int i = 0; i < tile_A::I; ++i) {
+                    wp[itA][i] = x[(itA*tile_A::I + i)*stride_row + col_next];
+                }
             }
         }
 
