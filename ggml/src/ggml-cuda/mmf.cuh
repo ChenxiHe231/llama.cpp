@@ -39,6 +39,8 @@ struct mmf_ids_data {
     const int32_t * expert_bounds_dev = nullptr;
     int n_experts = 0;
     int sis1 = 0;
+    // Direction B: optional bf16 activation buffer (contiguous) to halve gather DRAM traffic.
+    const void * y_bf16 = nullptr;
 };
 
 void ggml_cuda_mul_mat_f(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst);
@@ -303,7 +305,8 @@ static __global__ void mul_mat_f_ids(
         const int ncols, const int ncols_dst_total, const int nchannels_dst, const int stride_row, const int stride_col_y, const int stride_col_dst,
         const int channel_ratio, const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
         const int sample_ratio, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
-        const uint3 sis1_fd, const uint3 nch_fd) {
+        const uint3 sis1_fd, const uint3 nch_fd,
+        const nv_bfloat16 * __restrict__ y_bf16) {
 // TODO: handle this in a consistent and simpler way after AMD MFMA support has been added
 #if defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)
 #if defined(AMD_WMMA_AVAILABLE)
@@ -365,6 +368,10 @@ static __global__ void mul_mat_f_ids(
     x   += int64_t(sample_x)  *stride_sample_x   + channel_x  *stride_channel_x  + row0*stride_row;
     y   += int64_t(sample_y)  *stride_sample_y;
     dst += int64_t(sample_dst)*stride_sample_dst;
+
+    // Direction B: bf16 activation buffer mirrors src1 element layout/strides exactly,
+    // so it uses the identical index arithmetic as the float path (same element strides).
+    const nv_bfloat16 * y_bf16_s = y_bf16 ? y_bf16 + int64_t(sample_y)*stride_sample_y : nullptr;
 
     const int32_t * ids_src_expert = ids_src_compact + expert_start;
     const int32_t * ids_dst_expert = ids_dst_compact + expert_start;
@@ -457,7 +464,14 @@ static __global__ void mul_mat_f_ids(
                         const int token   = (int) qrm.x;
                         const int channel = (int) qrm.y;
                         if (token < ncols_dst_total) {
-                            tmp = *(const float2*) &y[channel*stride_channel_y + 2*(token*stride_col_y + col)];
+                            const int64_t idx = channel*stride_channel_y + 2*(token*stride_col_y + col);
+                            if (y_bf16_s) {
+                                // 2B/elt bf16 gather (4B total) vs float2 (8B): half the DRAM re-read traffic.
+                                const nv_bfloat162 b = *(const nv_bfloat162*) &y_bf16_s[idx];
+                                tmp = make_float2(__bfloat162float(b.x), __bfloat162float(b.y));
+                            } else {
+                                tmp = *(const float2*) &y[idx];
+                            }
                         }
                     }
                     vals[j0] = tmp;
@@ -593,12 +607,16 @@ static inline void mul_mat_f_switch_ids(
         const uint3 sis1_fd = ids_data->sis1 > 0 ? init_fastdiv_values((uint32_t) ids_data->sis1) : make_uint3(0, 0, 1);
         const uint3 nch_fd  = init_fastdiv_values((uint32_t) nchannels_dst);
 
+        // Direction B: bf16 activation buffer mirrors src1 element layout (same strides), bf16 dtype.
+        const nv_bfloat16 * y_bf16 = (const nv_bfloat16 *) ids_data->y_bf16;
+
         mul_mat_f_ids<T, rows_per_block, cols_per_block, nwarps><<<block_nums_ids, block_dims, nbytes_shared_total, stream>>>
             (x, y, ids_data->ids_src_compact, ids_data->ids_dst_compact, ids_data->expert_bounds_dev, dst,
             ncols_x, ncols_dst, nchannels_dst, stride_row, stride_col_y, stride_col_dst,
             channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
             sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst,
-            sis1_fd, nch_fd);
+            sis1_fd, nch_fd,
+            y_bf16);
     } else if (ids) {
         const int64_t col_tiles = (ncols_dst + cols_per_block - 1) / cols_per_block;
         dim3 block_nums_ids = block_nums;

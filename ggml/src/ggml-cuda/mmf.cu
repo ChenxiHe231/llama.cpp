@@ -1,6 +1,7 @@
 #include "ggml.h"
 #include "mmf.cuh"
 #include "mmid.cuh"
+#include "convert.cuh"
 
 static __forceinline__ int mmf_get_rows_per_block(const int cc) {
     if (GGML_CUDA_CC_IS_CDNA(cc)) {
@@ -51,6 +52,7 @@ void ggml_cuda_mul_mat_f(ggml_backend_cuda_context & ctx, const ggml_tensor * sr
     ggml_cuda_pool_alloc<int32_t> ids_src_compact_dev;
     ggml_cuda_pool_alloc<int32_t> ids_dst_compact_dev;
     ggml_cuda_pool_alloc<int32_t> expert_bounds_dev;
+    ggml_cuda_pool_alloc<nv_bfloat16> y_bf16_dev; // Direction B: bf16 activations (halve gather traffic)
 
     // For MUL_MAT_ID the memory layout is different than for MUL_MAT:
     const int64_t ncols_dst          = ids ? ne2  : ne1;
@@ -93,6 +95,19 @@ void ggml_cuda_mul_mat_f(ggml_backend_cuda_context & ctx, const ggml_tensor * sr
         ids_info.expert_bounds_dev = expert_bounds_dev.get();
         ids_info.n_experts         = static_cast<int>(n_experts);
         ids_info.sis1              = sis1;
+
+        // Direction B: convert F32 activations -> contiguous bf16 once, so the per-row-block
+        // re-gather reads 2B/elt instead of 4B/elt. The mma truncates activations to bf16 anyway.
+        // Requires contiguous src1 so the contiguous bf16 buffer mirrors src1 element strides.
+        if (src0->type == GGML_TYPE_BF16 && ggml_is_contiguous(src1)) {
+            const int64_t n_y = ggml_nelements(src1);
+            y_bf16_dev.alloc(ctx.pool(), n_y);
+            to_bf16_cuda_t to_bf16 = ggml_get_to_bf16_cuda(GGML_TYPE_F32);
+            GGML_ASSERT(to_bf16 != nullptr);
+            to_bf16(src1_d, y_bf16_dev.get(), n_y, ctx.stream());
+            ids_info.y_bf16 = y_bf16_dev.get();
+        }
+
         ids_info_ptr = &ids_info;
     }
 
