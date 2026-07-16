@@ -9,6 +9,13 @@ using namespace ggml_cuda_mma;
 #define MMF_ROWS_PER_BLOCK 32
 #define MMF_ROWS_PER_BLOCK_CDNA 64
 
+// R3-1: storage width of the inter-warp combine buffer (per-warp C-tile partials).
+// Narrowing float(4B)->16-bit halves the combine LDS region so gate/up reaches 2 blocks/CU.
+// Cross-warp reduction still accumulates in FP32 registers (partials read + cast to float).
+#ifndef MMF_COMBINE_T
+#define MMF_COMBINE_T nv_bfloat16
+#endif
+
 static __forceinline__ int64_t mmf_get_max_block_size(int cc) {
     if (GGML_CUDA_CC_IS_CDNA(cc)) {
         return 512;
@@ -226,7 +233,7 @@ static __global__ void mul_mat_f(
         }
     }
 
-    float * buf_iw = (float *) compute_base;
+    MMF_COMBINE_T * buf_iw = (MMF_COMBINE_T *) compute_base;
     constexpr int kiw = nwarps*rows_per_block + mmf_get_padding();
 
     if (nwarps > 1) {
@@ -240,7 +247,7 @@ static __global__ void mul_mat_f(
             for (int l = 0; l < tile_C::ne; ++l) {
                 const int i = threadIdx.y*rows_per_block + itA*tile_C::I + tile_C::get_i(l);
                 const int j = itB*tile_C::J + tile_C::get_j(l);
-                buf_iw[j*kiw + i] = C[itA][itB].x[l];
+                buf_iw[j*kiw + i] = ggml_cuda_cast<MMF_COMBINE_T>(C[itA][itB].x[l]);
             }
         }
     }
@@ -265,7 +272,7 @@ static __global__ void mul_mat_f(
             for (int i1 = 0; i1 < sizeof(sum)/sizeof(sum[0]); ++i1) {
                 const int i = i0 + i1*warp_size + threadIdx.x;
 
-                sum[i1] += buf_iw[j*kiw + i];
+                sum[i1] += (float) buf_iw[j*kiw + i];
             }
         }
 
@@ -516,7 +523,7 @@ static __global__ void mul_mat_f_ids(
         }
     }
 
-    float * buf_iw = (float *) compute_base;
+    MMF_COMBINE_T * buf_iw = (MMF_COMBINE_T *) compute_base;
     constexpr int kiw = nwarps*rows_per_block + mmf_get_padding();
 
     if (nwarps > 1) {
@@ -530,7 +537,7 @@ static __global__ void mul_mat_f_ids(
             for (int l = 0; l < tile_C::ne; ++l) {
                 const int i = threadIdx.y*rows_per_block + itA*tile_C::I + tile_C::get_i(l);
                 const int j = itB*tile_C::J + tile_C::get_j(l);
-                buf_iw[j*kiw + i] = C[itA][itB].x[l];
+                buf_iw[j*kiw + i] = ggml_cuda_cast<MMF_COMBINE_T>(C[itA][itB].x[l]);
             }
         }
     }
@@ -555,7 +562,7 @@ static __global__ void mul_mat_f_ids(
             for (int i1 = 0; i1 < sizeof(sum)/sizeof(sum[0]); ++i1) {
                 const int i = i0 + i1*warp_size + threadIdx.x;
 
-                sum[i1] += buf_iw[j * kiw + i];
+                sum[i1] += (float) buf_iw[j * kiw + i];
             }
         }
 
@@ -674,7 +681,7 @@ void mul_mat_f_cuda(
 
     const int nbytes_shared_iter = nwarps_best * (volta_mma_available(cc) ? tile_A_32::I : tile_A_16::I) * (warp_size + mmf_get_padding(cc)) * 4;
     const int nbytes_cols_per_block_pad = (amd_wmma_available(cc) || amd_mfma_available(cc)) ? tile_B_16::I : tile_B_8::I;
-    const int nbytes_shared_combine = GGML_PAD(cols_per_block, nbytes_cols_per_block_pad) * (nwarps_best*rows_per_block + mmf_get_padding(cc)) * 4;
+    const int nbytes_shared_combine = GGML_PAD(cols_per_block, nbytes_cols_per_block_pad) * (nwarps_best*rows_per_block + mmf_get_padding(cc)) * sizeof(MMF_COMBINE_T);
     const int nbytes_shared = std::max(nbytes_shared_iter, nbytes_shared_combine);
     const int nbytes_slotmap = ids ? GGML_PAD(cols_per_block, 16) * sizeof(int) : 0;
     const int nbytes_shared_total = nbytes_shared + nbytes_slotmap;
