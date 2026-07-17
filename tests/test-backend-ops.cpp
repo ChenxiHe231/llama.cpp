@@ -24,6 +24,7 @@
 #include <atomic>
 #include <array>
 #include <cfloat>
+#include <cmath>
 #include <cinttypes>
 #include <cstdarg>
 #include <cstdint>
@@ -4156,19 +4157,71 @@ struct test_mul_mat_hadamard : public test_mul_mat {
     }
 };
 
-static void init_mul_mat_id_tensors(ggml_context * ctx, int n_mats) {
+// Expert-routing distribution for mul_mat_id id-tensor generation.
+//   UNIFORM: perfectly balanced round-robin (i % n_mats) + shuffle (existing default).
+//   SKEWED : Zipf/power-law concentrated routing so a few "hot" experts receive most
+//            tokens while many "cold" experts receive few or zero -> exercises the
+//            compact-ids mmf load-imbalance path (empty & overloaded experts).
+enum mmid_routing { MMID_ROUTING_UNIFORM = 0, MMID_ROUTING_SKEWED = 1 };
+
+static std::string var_to_str(mmid_routing r) {
+    return r == MMID_ROUTING_SKEWED ? "skewed" : "uniform";
+}
+
+static void init_mul_mat_id_tensors(ggml_context * ctx, int n_mats,
+                                    mmid_routing routing = MMID_ROUTING_UNIFORM) {
     std::random_device rd;
     std::default_random_engine rng(rd());
+
+    // Precompute a Zipf(s=1.2) cumulative distribution over experts for SKEWED routing.
+    // A random permutation of expert ids is applied so the "hot" experts are not always
+    // the low-index ones (avoids any accidental alignment with tile/block layout).
+    std::vector<double> zipf_cdf;
+    std::vector<int32_t> expert_perm;
+    if (routing == MMID_ROUTING_SKEWED) {
+        const double s = 1.2;
+        zipf_cdf.resize(n_mats);
+        double acc = 0.0;
+        for (int i = 0; i < n_mats; i++) {
+            acc += 1.0 / std::pow((double)(i + 1), s);
+            zipf_cdf[i] = acc;
+        }
+        for (int i = 0; i < n_mats; i++) { zipf_cdf[i] /= acc; }
+        expert_perm.resize(n_mats);
+        for (int i = 0; i < n_mats; i++) { expert_perm[i] = i; }
+        std::shuffle(expert_perm.begin(), expert_perm.end(), rng);
+    }
+
     for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
         if (t->type == GGML_TYPE_I32) {
             if (ggml_is_view_op(t->op)) { continue; }
             // ids
             for (int64_t r = 0; r < ggml_nrows(t); r++) {
                 std::vector<int32_t> data(t->ne[0]);
-                for (int i = 0; i < t->ne[0]; i++) {
-                    data[i] = i % n_mats;
+                if (routing == MMID_ROUTING_SKEWED) {
+                    // Each token (row) selects t->ne[0] DISTINCT experts by rejection
+                    // sampling from the Zipf distribution. The full row is a valid
+                    // selection; the graph views the first n_used entries per token.
+                    std::uniform_real_distribution<double> ur(0.0, 1.0);
+                    std::vector<char> used(n_mats, 0);
+                    int filled = 0;
+                    while (filled < t->ne[0]) {
+                        double u = ur(rng);
+                        int lo = 0, hi = n_mats - 1, idx = n_mats - 1;
+                        while (lo <= hi) {
+                            int mid = (lo + hi) / 2;
+                            if (zipf_cdf[mid] >= u) { idx = mid; hi = mid - 1; }
+                            else { lo = mid + 1; }
+                        }
+                        int32_t e = expert_perm[idx];
+                        if (!used[e]) { used[e] = 1; data[filled++] = e; }
+                    }
+                } else {
+                    for (int i = 0; i < t->ne[0]; i++) {
+                        data[i] = i % n_mats;
+                    }
+                    std::shuffle(data.begin(), data.end(), rng);
                 }
-                std::shuffle(data.begin(), data.end(), rng);
                 ggml_backend_tensor_set(t, data.data(), r * t->nb[1], t->ne[0] * sizeof(int32_t));
             }
         } else {
@@ -4187,9 +4240,10 @@ struct test_mul_mat_id : public test_case {
     const int64_t m;
     const int64_t n;
     const int64_t k;
+    const mmid_routing routing; // expert-routing distribution (UNIFORM default / SKEWED)
 
     std::string vars() override {
-        return VARS_TO_STR8(type_a, type_b, n_mats, n_used, b, m, n, k);
+        return VARS_TO_STR9(type_a, type_b, n_mats, n_used, b, m, n, k, routing);
     }
 
     double max_nmse_err() override {
@@ -4211,9 +4265,10 @@ struct test_mul_mat_id : public test_case {
 
     test_mul_mat_id(ggml_type type_a = GGML_TYPE_F32, ggml_type type_b = GGML_TYPE_F32,
             int n_mats = 8, int n_used = 2, bool b = false,
-            int64_t m = 32, int64_t n = 32, int64_t k = 32)
+            int64_t m = 32, int64_t n = 32, int64_t k = 32,
+            mmid_routing routing = MMID_ROUTING_UNIFORM)
         : type_a(type_a), type_b(type_b), n_mats(n_mats), n_used(n_used), b(b),
-            m(m), n(n), k(k) {
+            m(m), n(n), k(k), routing(routing) {
             GGML_ASSERT(n_used <= n_mats);
         }
 
@@ -4239,7 +4294,7 @@ struct test_mul_mat_id : public test_case {
     }
 
     void initialize_tensors(ggml_context * ctx) override {
-        init_mul_mat_id_tensors(ctx, n_mats);
+        init_mul_mat_id_tensors(ctx, n_mats, routing);
     }
 };
 
@@ -8636,6 +8691,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_BF16, GGML_TYPE_F32, 128, 8, false, 512, 512, 2048));
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_BF16, GGML_TYPE_F32, 256, 8, false, 512, 2049, 2048));
 
+    // SKEWED (non-uniform / Zipf) expert-routing coverage for the Qwen3.6-A3B BF16 MoE
+    // target shapes. Real MoE routing is imbalanced (hot experts get many tokens, cold
+    // experts few/none); the compact-ids mmf kernel handles per-expert variable token
+    // counts, so empty & overloaded experts are an otherwise-untested correctness path.
+    // 256 experts top-8; gate/up (N=512,K=2048) and down (N=2048,K=512); tok in {32,512,2048}.
+    for (int n_tok : {32, 512, 2048}) {
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_BF16, GGML_TYPE_F32, 256, 8, false, /*m=N=*/512,  /*n=tok=*/n_tok, /*k=K=*/2048, MMID_ROUTING_SKEWED));
+    }
+    for (int n_tok : {32, 512, 2048}) {
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_BF16, GGML_TYPE_F32, 256, 8, false, /*m=N=*/2048, /*n=tok=*/n_tok, /*k=K=*/512,  MMID_ROUTING_SKEWED));
+    }
+
     for (ggml_type type_a : base_types) {
         for (ggml_type type_b : {GGML_TYPE_F32, GGML_TYPE_F16}) {
             for (int n : {1, 16}) {
@@ -9388,6 +9455,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     }
     for (int bs : {1, 8, 16, 32, 64, 512}) {
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_BF16, GGML_TYPE_F32, 256, 8, false, 2048, bs, 512));
+    }
+
+    // SKEWED-routing perf: same BF16 MoE target shapes under realistic (Zipf) load
+    // imbalance so the mmf compact-ids kernel is benchmarked with hot/cold experts.
+    for (int bs : {32, 512, 2048}) {
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_BF16, GGML_TYPE_F32, 256, 8, false, 512, bs, 2048, MMID_ROUTING_SKEWED));
+    }
+    for (int bs : {32, 512}) {
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_BF16, GGML_TYPE_F32, 256, 8, false, 2048, bs, 512, MMID_ROUTING_SKEWED));
     }
 
     // gpt-oss-20b
