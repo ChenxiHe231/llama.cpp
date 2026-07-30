@@ -5538,7 +5538,7 @@ struct test_concat : public test_case {
     const std::array<int64_t, 4> ne_a;
     const int64_t ne_b_d;
     const int dim;
-    const int v; // view (1 << 0: non-cont a, 1 << 1: non-cont b)
+    const int v; // view (1 << 0: non-cont a, 1 << 1: non-cont b, 1 << 4: transposed b)
 
     std::string vars() override {
         return VARS_TO_STR5(type, ne_a, ne_b_d, dim, v);
@@ -5549,6 +5549,14 @@ struct test_concat : public test_case {
             int64_t ne_b_d = 5,
             int dim = 2, int v = 0)
         : type(type), ne_a(ne_a), ne_b_d(ne_b_d), dim(dim), v(v) {}
+
+    double max_nmse_err() override {
+        return 0.0;
+    }
+
+    double err(const float * a, const float * b, size_t n) override {
+        return std::memcmp(a, b, n * sizeof(float)) == 0 ? 0.0 : 1.0;
+    }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         auto ne_b = ne_a;
@@ -5573,6 +5581,13 @@ struct test_concat : public test_case {
 
             b = ggml_view_4d(ctx, b, ne_b[0], ne_b[1], ne_b[2], ne_b[3], b->nb[1], b->nb[2], b->nb[3], 0);
             ggml_set_name(b, "view_of_b");
+        } else if (v & 16) {
+            GGML_ASSERT(dim == 0);
+            std::swap(ne_b[0], ne_b[1]);
+            b = ggml_new_tensor(ctx, type, 4, ne_b.data());
+            ggml_set_name(b, "b");
+            b = ggml_transpose(ctx, b);
+            ggml_set_name(b, "transpose_of_b");
         } else {
             b = ggml_new_tensor(ctx, type, 4, ne_b.data());
             ggml_set_name(b, "b");
@@ -8947,6 +8962,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_concat(GGML_TYPE_I32, {11, 12, 13, 14}, 7, dim, v));
         }
     }
+
+    test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {3, 8192, 1, 1}, 2048, 0, 16));
+    test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {3, 8192, 1, 1},  512, 0, 16));
+    test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {3,   31, 2, 2}, 2048, 0, 16));
+    test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {3,   33, 2, 2}, 2048, 0, 16));
 
     for (ggml_sort_order order : {GGML_SORT_ORDER_ASC, GGML_SORT_ORDER_DESC}) {
         for (uint32_t i = 4; i <= 1024*1024; i *= 2) {
