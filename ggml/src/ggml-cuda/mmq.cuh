@@ -1336,8 +1336,9 @@ static __device__ __forceinline__ void vec_dot_q8_1_q8_1_dp4a(
 }
 
 template <int mmq_x, int mmq_y>
-static __device__ __forceinline__ void vec_dot_q8_1_q8_1_mma(
-    const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00) {
+static __device__ __forceinline__ void vec_dot_q8_1_q8_1_mma_impl(
+    const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum,
+    const int k00, const int valid_j) {
 #if defined(AMD_MFMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
     constexpr data_layout input_layout = get_input_data_layout();
     typedef tile<16,  8, int, input_layout>        tile_A;
@@ -1348,7 +1349,8 @@ static __device__ __forceinline__ void vec_dot_q8_1_q8_1_mma(
     constexpr int rows_per_warp = granularity;
     constexpr int ntx = rows_per_warp/tile_C::I; // Number of x minitiles per warp.
 
-    y += (threadIdx.y % ntx) * (tile_C::J*MMQ_TILE_Y_K);
+    const int warp_j_offset = (threadIdx.y % ntx) * tile_C::J;
+    y += warp_j_offset * MMQ_TILE_Y_K;
 
     const int   * x_qs = (const int   *) x;
     const half2 * x_dm = (const half2 *) x_qs + 2*MMQ_TILE_NE_K;
@@ -1367,7 +1369,7 @@ static __device__ __forceinline__ void vec_dot_q8_1_q8_1_mma(
         }
 
 #pragma unroll
-        for (int j0 = 0; j0 < mmq_x; j0 += ntx*tile_C::J) {
+        for (int j0 = 0; j0 < mmq_x && j0 + warp_j_offset <= valid_j; j0 += ntx*tile_C::J) {
             tile_B B;
             load_ldmatrix(B, y_qs + j0*MMQ_TILE_Y_K + k01, MMQ_TILE_Y_K);
 
@@ -1398,7 +1400,8 @@ static __device__ __forceinline__ void vec_dot_q8_1_q8_1_mma(
     constexpr int rows_per_warp = 2 * granularity;
     constexpr int ntx = rows_per_warp/tile_C::I; // Number of x minitiles per warp.
 
-    y += (threadIdx.y % ntx) * (tile_C::J*MMQ_TILE_Y_K);
+    const int warp_j_offset = (threadIdx.y % ntx) * tile_C::J;
+    y += warp_j_offset * MMQ_TILE_Y_K;
 
     const int   * x_qs = (const int   *) x;
     const half2 * x_dm = (const half2 *) x_qs + 2*MMQ_TILE_NE_K;
@@ -1433,7 +1436,7 @@ static __device__ __forceinline__ void vec_dot_q8_1_q8_1_mma(
     }
 
 #pragma unroll
-    for (int j0 = 0; j0 < mmq_x; j0 += ntx*tile_C::J) {
+    for (int j0 = 0; j0 < mmq_x && j0 + warp_j_offset <= valid_j; j0 += ntx*tile_C::J) {
 #pragma unroll
         for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += QI8_1) {
             tile_B   B;
@@ -1462,6 +1465,14 @@ static __device__ __forceinline__ void vec_dot_q8_1_q8_1_mma(
         }
     }
 #endif // defined(AMD_MFMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+}
+
+template <int mmq_x, int mmq_y>
+static __device__ __forceinline__ void vec_dot_q8_1_q8_1_mma(
+    const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00) {
+    // The constant bound folds back to the original fully-unrolled loop for
+    // Q4_K full tiles, Q6_K, and every other existing user.
+    vec_dot_q8_1_q8_1_mma_impl<mmq_x, mmq_y>(x, y, sum, k00, mmq_x - 1);
 }
 
 // Used for NVFP4, Q3_K, IQ2_S, and IQ2_XS
@@ -3512,8 +3523,36 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
 
         __syncthreads();
 
+#if defined(RDNA3_5)
+        if constexpr (type == GGML_TYPE_Q4_K) {
+            // Q4_K uses 16-column WMMA minitiles. On MoE/tail tiles, avoid
+            // evaluating minitiles that contain no valid output columns while
+            // retaining the wider block so tile_x is loaded only once.
+            if (tile_y_max_j < mmq_x - 1) {
+                vec_dot_q8_1_q8_1_mma_impl<mmq_x, mmq_y>(
+                    tile_x, tile_y, sum, 0, tile_y_max_j);
+                vec_dot_q8_1_q8_1_mma_impl<mmq_x, mmq_y>(
+                    tile_x, tile_y2, sum, MMQ_TILE_NE_K, tile_y_max_j);
+            } else {
+                vec_dot(tile_x, tile_y,  sum, 0);
+                vec_dot(tile_x, tile_y2, sum, MMQ_TILE_NE_K);
+            }
+        } else if constexpr (type == GGML_TYPE_Q5_K) {
+            // Keep one static WMMA body variant. A separate full-tile path
+            // duplicates the force-inlined body in ISA and raises VGPR usage.
+            const int valid_j = min(tile_y_max_j, mmq_x - 1);
+            vec_dot_q8_1_q8_1_mma_impl<mmq_x, mmq_y>(
+                tile_x, tile_y, sum, 0, valid_j);
+            vec_dot_q8_1_q8_1_mma_impl<mmq_x, mmq_y>(
+                tile_x, tile_y2, sum, MMQ_TILE_NE_K, valid_j);
+        } else {
+            vec_dot(tile_x, tile_y,  sum, 0);
+            vec_dot(tile_x, tile_y2, sum, MMQ_TILE_NE_K);
+        }
+#else
         vec_dot(tile_x, tile_y,  sum, 0);
         vec_dot(tile_x, tile_y2, sum, MMQ_TILE_NE_K);
+#endif // defined(RDNA3_5)
 
         __syncthreads();
     }
@@ -4176,4 +4215,3 @@ void ggml_cuda_op_mul_mat_q(
     const int64_t src1_padded_row_size, cudaStream_t stream);
 
 bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts);
-

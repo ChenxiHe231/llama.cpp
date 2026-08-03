@@ -52,33 +52,42 @@
 #   define N_THREADS std::thread::hardware_concurrency()
 #endif
 
-static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float max = 1.0f) {
+static void init_tensor_uniform(
+        ggml_tensor * tensor, float min = -1.0f, float max = 1.0f, uint32_t seed = 0) {
     size_t nels = ggml_nelements(tensor);
     std::vector<float> data(nels);
     {
-        // parallel initialization
-        static const size_t n_threads = N_THREADS;
-
-        auto init_thread = [&](size_t start, size_t end) {
-            thread_local std::default_random_engine gen(std::random_device{}());
+        if (seed != 0) {
+            std::default_random_engine gen(seed);
             std::uniform_real_distribution<float> distribution(min, max);
-            for (size_t i = start; i < end; i++) {
+            for (size_t i = 0; i < nels; i++) {
                 data[i] = distribution(gen);
             }
-        };
-
-        if (n_threads == 1) {
-            init_thread(0, nels);
         } else {
-            std::vector<std::future<void>> tasks;
-            tasks.reserve(n_threads);
-            for (size_t i = 0; i < n_threads; i++) {
-                size_t start =     i*nels/n_threads;
-                size_t end   = (i+1)*nels/n_threads;
-                tasks.push_back(std::async(std::launch::async, init_thread, start, end));
-            }
-            for (auto & t : tasks) {
-                t.get();
+            // parallel initialization
+            static const size_t n_threads = N_THREADS;
+
+            auto init_thread = [&](size_t start, size_t end) {
+                thread_local std::default_random_engine gen(std::random_device{}());
+                std::uniform_real_distribution<float> distribution(min, max);
+                for (size_t i = start; i < end; i++) {
+                    data[i] = distribution(gen);
+                }
+            };
+
+            if (n_threads == 1) {
+                init_thread(0, nels);
+            } else {
+                std::vector<std::future<void>> tasks;
+                tasks.reserve(n_threads);
+                for (size_t i = 0; i < n_threads; i++) {
+                    size_t start =     i*nels/n_threads;
+                    size_t end   = (i+1)*nels/n_threads;
+                    tasks.push_back(std::async(std::launch::async, init_thread, start, end));
+                }
+                for (auto & t : tasks) {
+                    t.get();
+                }
             }
         }
     }
@@ -4162,16 +4171,34 @@ struct test_mul_mat_hadamard : public test_mul_mat {
 //   SKEWED : Zipf/power-law concentrated routing so a few "hot" experts receive most
 //            tokens while many "cold" experts receive few or zero -> exercises the
 //            compact-ids mmf load-imbalance path (empty & overloaded experts).
-enum mmid_routing { MMID_ROUTING_UNIFORM = 0, MMID_ROUTING_SKEWED = 1 };
+//   FORCED_TAIL: test-only top-8 routing where expert 0 appears exactly a requested
+//                number of times, forcing precise expert-local 16/64-column tails.
+enum mmid_routing {
+    MMID_ROUTING_UNIFORM = 0,
+    MMID_ROUTING_SKEWED = 1,
+    MMID_ROUTING_BOUNDARY = 2,
+    MMID_ROUTING_FORCED_TAIL = 3,
+};
 
 static std::string var_to_str(mmid_routing r) {
-    return r == MMID_ROUTING_SKEWED ? "skewed" : "uniform";
+    switch (r) {
+        case MMID_ROUTING_UNIFORM:     return "uniform";
+        case MMID_ROUTING_SKEWED:      return "skewed";
+        case MMID_ROUTING_BOUNDARY:    return "boundary";
+        case MMID_ROUTING_FORCED_TAIL: return "forced_tail";
+    }
+    GGML_ABORT("fatal error");
 }
 
-static void init_mul_mat_id_tensors(ggml_context * ctx, int n_mats,
-                                    mmid_routing routing = MMID_ROUTING_UNIFORM) {
+static void init_mul_mat_id_tensors(
+        ggml_context * ctx, int n_mats, mmid_routing routing = MMID_ROUTING_UNIFORM,
+        uint32_t seed = 0, int forced_col_diff = 0) {
     std::random_device rd;
-    std::default_random_engine rng(rd());
+    std::default_random_engine rng(seed != 0 ? seed : rd());
+    if (routing == MMID_ROUTING_FORCED_TAIL) {
+        GGML_ASSERT(n_mats > 8);
+        GGML_ASSERT(forced_col_diff > 0);
+    }
 
     // Precompute a Zipf(s=1.2) cumulative distribution over experts for SKEWED routing.
     // A random permutation of expert ids is applied so the "hot" experts are not always
@@ -4192,10 +4219,56 @@ static void init_mul_mat_id_tensors(ggml_context * ctx, int n_mats,
         std::shuffle(expert_perm.begin(), expert_perm.end(), rng);
     }
 
+    // Deterministic 512-token/top-8 route with exact expert counts around all
+    // 16-column Q4_K WMMA minitile boundaries. The first 13 experts receive
+    // the requested counts; the remaining 3375 assignments are balanced over
+    // the other experts. Each token still selects eight distinct experts.
+    std::vector<std::array<int32_t, 8>> boundary_rows;
+    if (routing == MMID_ROUTING_BOUNDARY) {
+        GGML_ASSERT(n_mats == 256);
+        constexpr int n_tokens = 512;
+        constexpr int n_used = 8;
+        constexpr std::array<int, 13> boundary_counts = {
+            1, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128, 129,
+        };
+
+        std::vector<int> remaining(n_mats, 0);
+        int assigned = 0;
+        for (int i = 0; i < (int) boundary_counts.size(); ++i) {
+            remaining[i] = boundary_counts[i];
+            assigned += boundary_counts[i];
+        }
+        for (int i = (int) boundary_counts.size(); i < n_mats; ++i) {
+            const int n_left = n_tokens*n_used - assigned;
+            const int experts_left = n_mats - i;
+            remaining[i] = (n_left + experts_left - 1) / experts_left;
+            assigned += remaining[i];
+        }
+        GGML_ASSERT(assigned == n_tokens*n_used);
+
+        boundary_rows.resize(n_tokens);
+        std::vector<int32_t> order(n_mats);
+        for (int r = 0; r < n_tokens; ++r) {
+            std::iota(order.begin(), order.end(), 0);
+            std::stable_sort(order.begin(), order.end(), [&](int32_t a, int32_t b) {
+                return remaining[a] > remaining[b];
+            });
+            for (int i = 0; i < n_used; ++i) {
+                GGML_ASSERT(remaining[order[i]] > 0);
+                boundary_rows[r][i] = order[i];
+                --remaining[order[i]];
+            }
+        }
+        GGML_ASSERT(std::all_of(remaining.begin(), remaining.end(), [](int n) { return n == 0; }));
+    }
+
+    uint32_t tensor_seed = seed;
     for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
         if (t->type == GGML_TYPE_I32) {
             if (ggml_is_view_op(t->op)) { continue; }
             // ids
+            GGML_ASSERT(routing != MMID_ROUTING_FORCED_TAIL ||
+                        forced_col_diff <= ggml_nrows(t));
             for (int64_t r = 0; r < ggml_nrows(t); r++) {
                 std::vector<int32_t> data(t->ne[0]);
                 if (routing == MMID_ROUTING_SKEWED) {
@@ -4216,6 +4289,36 @@ static void init_mul_mat_id_tensors(ggml_context * ctx, int n_mats,
                         int32_t e = expert_perm[idx];
                         if (!used[e]) { used[e] = 1; data[filled++] = e; }
                     }
+                } else if (routing == MMID_ROUTING_BOUNDARY) {
+                    GGML_ASSERT(ggml_nrows(t) == (int64_t) boundary_rows.size());
+                    std::array<char, 256> used = {};
+                    int filled = 0;
+                    for (int32_t e : boundary_rows[r]) {
+                        data[filled++] = e;
+                        used[e] = 1;
+                    }
+                    for (int32_t e = 0; e < n_mats; ++e) {
+                        if (!used[e]) {
+                            data[filled++] = e;
+                        }
+                    }
+                    GGML_ASSERT(filled == n_mats);
+                } else if (routing == MMID_ROUTING_FORCED_TAIL) {
+                    // The graph views the first eight entries. Start from a full
+                    // permutation so every row remains a valid distinct-expert
+                    // selection, then place expert 0 inside/outside that view.
+                    for (int i = 0; i < t->ne[0]; i++) {
+                        data[i] = i;
+                    }
+                    std::shuffle(data.begin(), data.end(), rng);
+                    const auto it = std::find(data.begin(), data.end(), 0);
+                    GGML_ASSERT(it != data.end());
+                    const int pos = it - data.begin();
+                    if (r < forced_col_diff) {
+                        std::swap(data[0], data[pos]);
+                    } else if (pos < 8) {
+                        std::swap(data[pos], data[8]);
+                    }
                 } else {
                     for (int i = 0; i < t->ne[0]; i++) {
                         data[i] = i % n_mats;
@@ -4225,7 +4328,7 @@ static void init_mul_mat_id_tensors(ggml_context * ctx, int n_mats,
                 ggml_backend_tensor_set(t, data.data(), r * t->nb[1], t->ne[0] * sizeof(int32_t));
             }
         } else {
-            init_tensor_uniform(t);
+            init_tensor_uniform(t, -1.0f, 1.0f, seed != 0 ? ++tensor_seed : 0);
         }
     }
 }
@@ -4241,9 +4344,18 @@ struct test_mul_mat_id : public test_case {
     const int64_t n;
     const int64_t k;
     const mmid_routing routing; // expert-routing distribution (UNIFORM default / SKEWED)
+    const uint32_t routing_seed;
+    const int forced_col_diff;
 
     std::string vars() override {
-        return VARS_TO_STR9(type_a, type_b, n_mats, n_used, b, m, n, k, routing);
+        std::string v = VARS_TO_STR9(type_a, type_b, n_mats, n_used, b, m, n, k, routing);
+        if (type_a == GGML_TYPE_Q4_K && routing_seed != 0) {
+            v += "," + VAR_TO_STR(routing_seed);
+        }
+        if (forced_col_diff != 0) {
+            v += ",forced_col_diff=" + std::to_string(forced_col_diff);
+        }
+        return v;
     }
 
     double max_nmse_err() override {
@@ -4266,10 +4378,14 @@ struct test_mul_mat_id : public test_case {
     test_mul_mat_id(ggml_type type_a = GGML_TYPE_F32, ggml_type type_b = GGML_TYPE_F32,
             int n_mats = 8, int n_used = 2, bool b = false,
             int64_t m = 32, int64_t n = 32, int64_t k = 32,
-            mmid_routing routing = MMID_ROUTING_UNIFORM)
+            mmid_routing routing = MMID_ROUTING_UNIFORM,
+            uint32_t routing_seed = 0, int forced_col_diff = 0)
         : type_a(type_a), type_b(type_b), n_mats(n_mats), n_used(n_used), b(b),
-            m(m), n(n), k(k), routing(routing) {
+            m(m), n(n), k(k), routing(routing), routing_seed(routing_seed), forced_col_diff(forced_col_diff) {
             GGML_ASSERT(n_used <= n_mats);
+            GGML_ASSERT(routing != MMID_ROUTING_FORCED_TAIL || n_used == 8);
+            GGML_ASSERT(routing != MMID_ROUTING_FORCED_TAIL ||
+                        (forced_col_diff > 0 && forced_col_diff <= n));
         }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
@@ -4294,7 +4410,7 @@ struct test_mul_mat_id : public test_case {
     }
 
     void initialize_tensors(ggml_context * ctx) override {
-        init_mul_mat_id_tensors(ctx, n_mats, routing);
+        init_mul_mat_id_tensors(ctx, n_mats, routing, routing_seed, forced_col_diff);
     }
 };
 
@@ -8559,6 +8675,36 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_BF16, GGML_TYPE_F32, 256, 8, false,  512, 1, 2048)); // gate/up per-expert
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_BF16, GGML_TYPE_F32, 256, 8, false, 2048, 1,  512)); // down per-expert
 
+    // Qwen3.6-35B-A3B Q4_K_M MoE down projection. 512/2048 are production
+    // pp64k shapes; the remaining token counts cover selector and tail tiles.
+    constexpr uint32_t mmq_test_seed = 0x5eedu;
+    for (ggml_type type_a : {GGML_TYPE_Q5_K, GGML_TYPE_Q6_K}) {
+        for (int64_t n_tokens : {1, 8, 32, 64, 79, 80, 81, 128, 512, 2048}) {
+            test_cases.emplace_back(new test_mul_mat_id(
+                type_a, GGML_TYPE_F32, 256, 8, false, 2048, n_tokens, 512, MMID_ROUTING_UNIFORM, mmq_test_seed));
+            test_cases.emplace_back(new test_mul_mat_id(
+                type_a, GGML_TYPE_F32, 256, 8, false, 2048, n_tokens, 512, MMID_ROUTING_SKEWED, mmq_test_seed));
+        }
+        for (int64_t n_tokens : {1, 8, 32, 64, 128, 512, 2048}) {
+            test_cases.emplace_back(new test_mul_mat(
+                type_a, GGML_TYPE_F32, 2048, n_tokens, 512, {1, 1}, {1, 1}));
+        }
+    }
+
+    // Q5_K RDNA3.5 partial-tile Gate1: global T512 keeps the production J64
+    // selector while expert 0 is forced to exact 16-column and J64/J128
+    // boundaries. The final case combines a jt>0 tail with need_check=true.
+    for (int forced_col_diff : {
+            15, 16, 17, 31, 32, 33, 47, 48, 49,
+            63, 64, 65, 79, 80, 81, 127, 128, 129}) {
+        test_cases.emplace_back(new test_mul_mat_id(
+            GGML_TYPE_Q5_K, GGML_TYPE_F32, 256, 8, false, 2048, 512, 512,
+            MMID_ROUTING_FORCED_TAIL, mmq_test_seed, forced_col_diff));
+    }
+    test_cases.emplace_back(new test_mul_mat_id(
+        GGML_TYPE_Q5_K, GGML_TYPE_F32, 256, 8, false, 2047, 512, 512,
+        MMID_ROUTING_FORCED_TAIL, mmq_test_seed, 65));
+
     for (ggml_type type_a : other_types) {
         for (ggml_type type_b : {GGML_TYPE_F32}) {
             if (ggml_blck_size(type_a) != 256) {
@@ -8728,6 +8874,36 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (int n_tok : {32, 512, 2048}) {
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_BF16, GGML_TYPE_F32, 256, 8, false, /*m=N=*/2048, /*n=tok=*/n_tok, /*k=K=*/512,  MMID_ROUTING_SKEWED));
     }
+
+    // Qwen3.6-35B-A3B Q4_K gate/up expert weights:
+    // A ne=[2048,512,256], B ne=[2048,8,n_tok], ids ne=[8,n_tok].
+    // Routing is production-shaped synthetic data, not captured model routing.
+    constexpr uint32_t q4_k_routing_seed = 0x514b4d4d;
+    // 15/16/17, 31/32/33, and 63/64/65 exercise every boundary of the
+    // Q4_K tail-aware 16-column WMMA minitile loop. Small seeded-skew cases
+    // also cover empty experts; 65 crosses the 64-column boundary and
+    // exercises a multi-tile tail under the selected J. Production J64
+    // routing is traced separately at T512/T2048.
+    for (int n_tok : {
+            1, 8, 15, 16, 17, 31, 32, 33, 63, 64, 65,
+            79, 80, 81, 128, 512, 2048}) {
+        test_cases.emplace_back(new test_mul_mat(
+            GGML_TYPE_Q4_K, GGML_TYPE_F32, 512, n_tok, 2048, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat_id(
+            GGML_TYPE_Q4_K, GGML_TYPE_F32, 256, 8, false, 512, n_tok, 2048,
+            MMID_ROUTING_UNIFORM, q4_k_routing_seed));
+        test_cases.emplace_back(new test_mul_mat_id(
+            GGML_TYPE_Q4_K, GGML_TYPE_F32, 256, 8, false, 512, n_tok, 2048,
+            MMID_ROUTING_SKEWED, q4_k_routing_seed));
+    }
+    // need_check=true plus a deterministic single route whose expert counts
+    // are exactly {1,15,16,17,31,32,33,63,64,65,127,128,129} for the first
+    // experts. This exercises partial minitiles in jt>0 output tiles too.
+    test_cases.emplace_back(new test_mul_mat(
+        GGML_TYPE_Q4_K, GGML_TYPE_F32, 511, 65, 2048, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat_id(
+        GGML_TYPE_Q4_K, GGML_TYPE_F32, 256, 8, false, 511, 512, 2048,
+        MMID_ROUTING_BOUNDARY, q4_k_routing_seed));
 
     for (ggml_type type_a : base_types) {
         for (ggml_type type_b : {GGML_TYPE_F32, GGML_TYPE_F16}) {
@@ -9496,6 +9672,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_BF16, GGML_TYPE_F32, 256, 8, false, 2048, bs, 512));
     }
 
+    // Fixed-seed Q5_K MoE down-projection cases for exact-shape MMQ A/B measurements.
+    constexpr uint32_t mmq_q5_perf_seed = 0x5eedu;
+    for (int bs : {512, 2048}) {
+        for (mmid_routing routing : {MMID_ROUTING_UNIFORM, MMID_ROUTING_SKEWED}) {
+            test_cases.emplace_back(new test_mul_mat_id(
+                GGML_TYPE_Q5_K, GGML_TYPE_F32, 256, 8, false, 2048, bs, 512, routing, mmq_q5_perf_seed));
+        }
+        // Exact dense/full-tile guard for measuring the unified runtime
+        // valid_j predicate without MoE tail savings.
+        test_cases.emplace_back(new test_mul_mat(
+            GGML_TYPE_Q5_K, GGML_TYPE_F32, 2048, bs, 512, {1, 1}, {1, 1}));
+    }
+
     // SKEWED-routing perf: same BF16 MoE target shapes under realistic (Zipf) load
     // imbalance so the mmf compact-ids kernel is benchmarked with hot/cold experts.
     for (int bs : {32, 512, 2048}) {
@@ -9503,6 +9692,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     }
     for (int bs : {32, 512}) {
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_BF16, GGML_TYPE_F32, 256, 8, false, 2048, bs, 512, MMID_ROUTING_SKEWED));
+    }
+
+    // Qwen3.6-35B-A3B Q4_K gate/up MMQ perf. Include the J64/J80 selector
+    // boundaries plus the full-ubatch production shape, with deterministic
+    // balanced and skewed routing for paired candidate comparisons.
+    constexpr uint32_t q4_k_perf_routing_seed = 0x514b4d4d;
+    for (int bs : {64, 79, 80, 81, 128, 512, 2048}) {
+        test_cases.emplace_back(new test_mul_mat(
+            GGML_TYPE_Q4_K, GGML_TYPE_F32, 512, bs, 2048, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat_id(
+            GGML_TYPE_Q4_K, GGML_TYPE_F32, 256, 8, false, 512, bs, 2048,
+            MMID_ROUTING_UNIFORM, q4_k_perf_routing_seed));
+        test_cases.emplace_back(new test_mul_mat_id(
+            GGML_TYPE_Q4_K, GGML_TYPE_F32, 256, 8, false, 512, bs, 2048,
+            MMID_ROUTING_SKEWED, q4_k_perf_routing_seed));
     }
 
     // gpt-oss-20b
